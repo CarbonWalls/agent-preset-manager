@@ -1,0 +1,3 @@
+- insert:
+    - id: web-agent-presets
+      name: '@local/dsh-web-agent-presets'
