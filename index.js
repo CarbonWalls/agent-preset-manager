@@ -2,31 +2,49 @@
  * Agent Presets — Host half.
  *
  * Serves a small authenticated bridge on the web server so the Web UI can
- * create, duplicate, edit and delete named agent presets. Presets are ordinary
- * `@deepseek-ai/dsh-agent-preset` declarations:
- *   - create  → a generated patch-only bundle is installed with pluginManager (the
- *               same mechanism the Plugins page and Creator mode use);
- *   - edit    → configEditor rewrites the preset row's declaration and hot-reloads it;
- *   - delete  → the generated bundle is removed with pluginManager, and any stale
- *               configEditor override row is cleaned out of the profile patch.
+ * create, duplicate, edit and delete named agent presets.
  *
- * Only public Host services are used (webServer, pluginManager, configEditor,
- * agentPresets); no dsh-internal packages are imported.
+ * Presets are ordinary `@deepseek-ai/dsh-agent-preset` declarations carried by
+ * a single managed "data bundle" (`<profile>/web-agent-presets/data`): one
+ * marker-delimited section per preset inside its `cordis.patch.yml`. Every
+ * save rewrites that one small file and pushes it back through the plugin
+ * manager's HMR reload by toggling the bundle layer — no `pnpm install` per
+ * operation — so save stays fast even on modest machines.
+ *
+ * The one genuinely slow Host read (`agentPresets.remoteExportList`, which
+ * waits on every fiber in every preset tree) is memoized with a short TTL and
+ * invalidated on every write, so opening the page and re-listing after a save
+ * are both fast.
+ *
+ * Only public Host services are used (webServer, pluginManager, agentPresets).
  */
 import { join } from 'node:path'
-import { mkdir, writeFile, readFile, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, writeFile, readFile, cp, rename, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { parseDocument, parse } from 'yaml'
+import { parse } from 'yaml'
 
 export const name = 'web-agent-presets'
 export const inject = []
 
 const PRESET_PACKAGE = '@deepseek-ai/dsh-agent-preset'
-const GENERATED_PREFIX = '@local/web-agent-preset-'
+const DATA_PACKAGE = '@local/dsh-web-agent-preset-data'
 const BRIDGE_PREFIX = '/api/web-agent-presets'
 const MAX_BODY_BYTES = 512 * 1024
 
 const JS_TAG = { tag: 'tag:yaml.org,2002:js', resolve: (value) => value }
+
+const DOC_HEADER =
+  '# Managed by web-agent-presets (Settings > Preset manager).\n' +
+  '# One section per preset sits between its markers and round-trips verbatim.'
+
+const ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+const SECTION_RE = /# >>> preset:([A-Za-z0-9.-]+) kind=(insert|override)\n/g
+
+// remoteExportList waits on every preset fiber (~seconds on a large profile).
+// Memoize it briefly and invalidate on every write so repeated lists are fast.
+let rosterCache = { at: 0, value: null }
+const ROSTER_TTL_MS = 60_000
 
 /** Error carrying a stable machine-readable code for the bridge response. */
 class BridgeError extends Error {
@@ -36,10 +54,8 @@ class BridgeError extends Error {
   }
 }
 
-const ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
-
 export function apply(ctx) {
-  ctx.inject(['webServer', 'pluginManager', 'configEditor', 'agentPresets'], (sctx) => {
+  ctx.inject(['webServer', 'pluginManager', 'agentPresets'], (sctx) => {
     sctx.effect(() => {
       const routes = makeRoutes(sctx)
       const disposers = routes.map((route) => sctx.webServer.register(route))
@@ -52,50 +68,173 @@ export function apply(ctx) {
 
 /** @param {import('@deepseek-ai/cordis').Context} sctx */
 function makeRoutes(sctx) {
-  const { pluginManager, configEditor, agentPresets } = sctx
+  const { pluginManager, agentPresets } = sctx
 
-  /** Generated preset bundles live inside the profile directory so pnpm's
-   * `file:` dependency stays inside the workspace it installs into. */
-  const generatedDir = () =>
-    join(sctx.get?.('profileContext')?.dir ?? join(homedir(), '.dsh'), 'web-agent-presets')
+  const profileDir = () => sctx.get?.('profileContext')?.dir ?? join(homedir(), '.dsh')
+  const dataDir = () => join(profileDir(), 'web-agent-presets', 'data')
+  const patchPath = () => join(dataDir(), 'cordis.patch.yml')
 
-  /** Roster merged with which presets we generated (editable / deletable here). */
-  async function listRoster() {
-    const roster = (await agentPresets.remoteExportList()).presets
-    const bundleByPreset = new Map()
-    try {
-      const bundles = await pluginManager.listBundles()
-      for (const bundle of bundles) {
-        if (typeof bundle.name !== 'string' || !bundle.name.startsWith(GENERATED_PREFIX)) continue
-        for (const row of bundle.rows ?? []) {
-          if (
-            typeof row.rowId === 'string' &&
-            row.rowId.startsWith('preset-') &&
-            row.moduleName === PRESET_PACKAGE
-          ) {
-            bundleByPreset.set(row.rowId.slice('preset-'.length), bundle.name)
-          }
-        }
+  /** Ensure the managed data-bundle package exists and return its facts. */
+  async function ensureDataBundle() {
+    const dir = dataDir()
+    await mkdir(dir, { recursive: true })
+    const pkgPath = join(dir, 'package.json')
+    let name = DATA_PACKAGE
+    if (existsSync(pkgPath)) {
+      try {
+        const existing = JSON.parse(await readFile(pkgPath, 'utf8'))
+        if (existing && typeof existing.name === 'string') name = existing.name
+      } catch {
+        throw new BridgeError('data-corrupt', 'The preset data bundle manifest cannot be read; restore it from the Plugin Manager page.')
       }
-    } catch {
-      // a bundle-list failure must not block the roster
+    } else {
+      await writeFile(
+        pkgPath,
+        JSON.stringify(
+          {
+            name: DATA_PACKAGE,
+            version: '1.0.0',
+            private: true,
+            type: 'module',
+            dsh: { bundle: { patch: './cordis.patch.yml' } },
+          },
+          null,
+          2,
+        ) + '\n',
+      )
     }
-    return roster.map((preset) => ({
-      id: preset.id,
-      name: preset.name,
-      description: preset.description,
-      isDefault: preset.isDefault,
-      broken: preset.broken,
-      custom: bundleByPreset.has(preset.id),
-      bundle: bundleByPreset.get(preset.id),
-    }))
+    return { dir, name, patchPath: join(dir, 'cordis.patch.yml') }
   }
+
+  /** Read the managed patch: preamble header + marker-delimited sections. */
+  async function readDoc() {
+    const path = patchPath()
+    if (!existsSync(path)) return { header: DOC_HEADER, sections: [] }
+    const text = await readFile(path, 'utf8')
+    const lines = text.split('\n')
+    let i = 0
+    while (i < lines.length) {
+      const line = lines[i]
+      if (line.startsWith('# >>>') || (line.trim() !== '' && !line.startsWith('#'))) break
+      i++
+    }
+    const header = lines.slice(0, i).join('\n')
+    const rest = lines.slice(i).join('\n')
+    const sections = []
+    let lastEnd = -1
+    let match
+    while ((match = SECTION_RE.exec(rest)) !== null) {
+      const closeMarker = `# <<< preset:${match[1]}`
+      const close = rest.indexOf('\n' + closeMarker, match.index)
+      if (close === -1) throw new BridgeError('data-corrupt', `the managed patch lost its closing marker for preset ${match[1]}`)
+      const body = rest.slice(SECTION_RE.lastIndex, close)
+      if (match.index > lastEnd + 1) {
+        const stray = rest.slice(lastEnd + 1, match.index).trim()
+        if (stray && stray !== '[]') throw new BridgeError('data-corrupt', 'the managed patch has content outside its markers')
+      }
+      sections.push({ id: match[1], kind: match[2], body })
+      lastEnd = close + closeMarker.length + 1
+    }
+    if (lastEnd >= 0) {
+      const tail = rest.slice(lastEnd).trim()
+      if (tail && tail !== '[]') throw new BridgeError('data-corrupt', 'the managed patch has content after its last section')
+    } else if (rest.trim() !== '[]' && rest.trim() !== '') {
+      throw new BridgeError('data-corrupt', 'the managed patch was hand-edited outside its markers')
+    }
+    return { header, sections }
+  }
+
+  /** Write the managed patch with a best-effort .bak, atomically. */
+  async function writeDoc(sections, header) {
+    const path = patchPath()
+    const body = sections.length === 0
+      ? '[]'
+      : sections.map((s) => `# >>> preset:${s.id} kind=${s.kind}\n${s.body}\n# <<< preset:${s.id}`).join('\n')
+    const text = `${header || DOC_HEADER}\n\n${body}\n`
+    if (existsSync(path)) await cp(path, path + '.bak').catch(() => {})
+    const tmp = path + '.tmp'
+    await writeFile(tmp, text)
+    await rename(tmp, path)
+  }
+
+  // ------------------------------------------------------------ yaml emission
+
+  function yamlScalar(value) {
+    if (value === undefined || value === null || value === '') return undefined
+    const flat = String(value).replace(/\s+/g, ' ').trim()
+    if (flat === '') return undefined
+    return `'${flat.replace(/'/g, "''")}'`
+  }
+
+  function indentLines(text, spaces) {
+    const pad = ' '.repeat(spaces)
+    return text
+      .split('\n')
+      .map((line) => (line.length > 0 ? pad + line : line))
+      .join('\n')
+  }
+
+  function configLines(fields, pad) {
+    const p = ' '.repeat(pad)
+    const lines = [`${p}id: ${fields.id}`]
+    const name = yamlScalar(fields.name)
+    if (name !== undefined) lines.push(`${p}name: ${name}`)
+    const description = yamlScalar(fields.description)
+    if (description !== undefined) lines.push(`${p}description: ${description}`)
+    if (fields.order !== undefined && fields.order !== null && fields.order !== '' && Number.isFinite(Number(fields.order))) {
+      lines.push(`${p}order: ${Number(fields.order)}`)
+    }
+    lines.push(`${p}plugins:`)
+    const plugins = typeof fields.pluginsYaml === 'string' ? fields.pluginsYaml.trim() : ''
+    if (plugins) lines.push(indentLines(plugins, pad + 2))
+    else lines.push(`${' '.repeat(pad + 2)}[]`)
+    return lines.join('\n')
+  }
+
+  function insertSection(fields) {
+    const pad = 8
+    const lines = [
+      '- insert:',
+      `    - id: preset-${fields.id}`,
+      `      name: '${PRESET_PACKAGE}'`,
+      '      config:',
+      configLines(fields, pad),
+    ]
+    return lines.join('\n')
+  }
+
+  // ------------------------------------------------------------------- roster
+
+  async function invalidateCaches() {
+    rosterCache = { at: 0, value: null }
+  }
+
+  async function cachedRoster() {
+    const now = Date.now()
+    if (rosterCache.value !== null && now - rosterCache.at < ROSTER_TTL_MS) return rosterCache.value
+    const value = await agentPresets.remoteExportList()
+    rosterCache = { at: now, value }
+    return value
+  }
+
+  /** Weak helper: which presets does this page manage (cheap patch read). */
+  async function managedIds() {
+    try {
+      const doc = await readDoc()
+      return new Set(doc.sections.map((section) => section.id))
+    } catch {
+      // a corrupt patch must not block the roster page; writes will surface it
+      return new Set()
+    }
+  }
+
+  // -------------------------------------------------------------- validation
 
   function assertNewId(id) {
     if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
       throw new BridgeError(
         'invalid-id',
-        'Preset id must only contain lowercase letters, digits and hyphens (e.g. "code-reviewer").'
+        'Preset id must only contain lowercase letters, digits and hyphens (e.g. "code-reviewer").',
       )
     }
   }
@@ -104,6 +243,18 @@ function makeRoutes(sctx) {
     if (typeof name !== 'string' || name.trim().length === 0) {
       throw new BridgeError('invalid-name', 'A display name is required.')
     }
+  }
+
+  function presetFields(request) {
+    const fields = {}
+    const name = typeof request?.name === 'string' ? request.name.trim() : ''
+    if (name !== '') fields.name = name
+    const description = typeof request?.description === 'string' ? request.description.trim() : ''
+    if (description !== '') fields.description = description
+    if (request?.order !== undefined && request.order !== null && request.order !== '' && Number.isFinite(Number(request.order))) {
+      fields.order = Number(request.order)
+    }
+    return fields
   }
 
   function parsePlugins(pluginsYaml) {
@@ -130,106 +281,63 @@ function makeRoutes(sctx) {
     return rows
   }
 
-  function declarationFields({ name, description, order }) {
-    const fields = {}
-    if (typeof name === 'string') fields.name = name
-    if (typeof description === 'string') fields.description = description
-    if (order !== undefined && order !== null && order !== '' && Number.isFinite(Number(order))) {
-      fields.order = Number(order)
+  // ---------------------------------------------------------------- persistence
+
+  /** Push the rewritten data bundle through the manager's HMR reload. */
+  async function applyDataBundle() {
+    const { dir, name } = await ensureDataBundle()
+    let result = await pluginManager.installBundle(dir, { enabled: true })
+    if (result?.application === 'failed' && result?.error?.code === 'already-installed') {
+      // Already a profile dependency: installBundle short-circuits, but a
+      // single setBundleEnabled(name, true) on an already-selected bundle still
+      // publishes and reconciles the profile — re-reading every patch from
+      // disk — so the just-rewritten data-bundle patch is applied with one
+      // recomposition (no off/on pair needed, saving a whole reload).
+      result = await pluginManager.setBundleEnabled(name, true)
     }
-    return fields
+    return summarize(result, name)
   }
 
-  /** Serialize the plugins list back to YAML (keeping `!!js` tags) and build the insert patch. */
-  function buildPatch(id, { name, description, order, pluginsYaml }) {
-    const document = parseDocument(pluginsYaml, { customTags: [JS_TAG] })
-    if (document.contents === null || document.errors.length > 0) {
-      throw new BridgeError('invalid-yaml', document.errors[0]?.message ?? 'The plugin list is empty.')
-    }
-    const pluginsText = document.toString().trimEnd()
-    const indent = (text, spaces) =>
-      text.split('\n').map((line) => (line.length > 0 ? ' '.repeat(spaces) + line : line)).join('\n')
-    const fields = declarationFields({ name, description, order })
-    let config = `        id: ${JSON.stringify(id)}`
-    if (fields.name !== undefined) config += `\n        name: ${JSON.stringify(fields.name)}`
-    if (fields.description !== undefined) config += `\n        description: ${JSON.stringify(fields.description)}`
-    if (fields.order !== undefined) config += `\n        order: ${JSON.stringify(fields.order)}`
-    return [
-      '- insert:',
-      `    - id: preset-${id}`,
-      `      name: '${PRESET_PACKAGE}'`,
-      '      config:',
-      config,
-      '        plugins:',
-      indent(pluginsText, 8),
-      '',
-    ].join('\n')
-  }
-
-  async function writeGeneratedBundle(id, declaration) {
-    const dir = join(generatedDir(), id)
-    await mkdir(dir, { recursive: true })
-    await writeFile(join(dir, 'cordis.patch.yml'), buildPatch(id, declaration), 'utf8')
-    await writeFile(join(dir, 'index.js'), 'export function apply() {}\n', 'utf8')
-    const manifest = {
-      name: GENERATED_PREFIX + id,
-      version: '1.0.0',
-      private: true,
-      type: 'module',
-      exports: { '.': './index.js' },
-      files: ['index.js', 'cordis.patch.yml'],
-      dsh: { bundle: { patch: './cordis.patch.yml' } },
-    }
-    await writeFile(join(dir, 'package.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8')
-    return dir
-  }
-
-  /** Drop a stale configEditor override row for a preset from the profile patch file. */
-  async function removeOverrideRow(id) {
-    const profile = sctx.get?.('profileContext')
-    if (!profile?.patchPath) return
-    const rowId = `preset-${id}`
-    try {
-      const before = await readFile(profile.patchPath, 'utf8')
-      const document = parseDocument(before, { customTags: [JS_TAG] })
-      if (document.contents === null || document.errors.length > 0) return
-      const seq = document.contents.items?.[0]
-      if (!seq) return
-      let changed = false
-      for (let index = seq.items.length - 1; index >= 0; index--) {
-        const item = seq.items[index]
-        if (typeof item?.get !== 'function') continue
-        const idValue = item.get('id')
-        const hasInsert = item.has('insert')
-        const nameValue = item.get('name')
-        if (!hasInsert && idValue === rowId && (nameValue === undefined || nameValue === PRESET_PACKAGE)) {
-          seq.deleteIn([index])
-          changed = true
-        }
-      }
-      if (changed) await writeFile(profile.patchPath, String(document), 'utf8')
-    } catch {
-      // leaving a stale override row behind is harmless (the loader skips it)
-    }
-  }
-
-  function summarize(result) {
+  function summarize(result, target) {
     return {
-      changed: result.changed ?? false,
-      application: result.application,
-      stage: result.stage,
-      target: result.target,
-      bundle: result.bundle,
-      version: result.version,
-      restartReason: result.restartReason,
-      warnings: result.warnings ?? [],
-      error: result.error ?? undefined,
+      changed: result?.changed === true,
+      application: result?.application,
+      stage: result?.stage,
+      target,
+      bundle: result?.bundle,
+      version: result?.version,
+      warnings: result?.warnings ?? [],
+      error: result?.error ? { code: result.error.code, diagnostic: result.error.diagnostic } : undefined,
+    }
+  }
+
+  async function ensureNewId(id) {
+    // Targeted duplicate probe: resolve() identifies one preset without the
+    // expensive full-roster diagnostic.
+    try {
+      await agentPresets.resolve(id)
+      throw new BridgeError('duplicate', `A preset named "${id}" already exists.`)
+    } catch (error) {
+      if (error instanceof BridgeError) throw error
+      // unknown id → safe to create
     }
   }
 
   const handlers = {
     async list() {
-      const presets = await listRoster()
+      const [managed, { name: dataName }, roster] = await Promise.all([managedIds(), ensureDataBundle(), cachedRoster()])
+      const presets = (roster?.presets ?? []).map((preset) => {
+        const custom = managed.has(preset.id)
+        return {
+          id: preset.id,
+          name: preset.name,
+          description: preset.description,
+          isDefault: preset.isDefault === true,
+          broken: preset.broken,
+          custom,
+          bundle: custom ? dataName : undefined,
+        }
+      })
       return { ok: true, value: { presets } }
     },
     async read(request) {
@@ -244,68 +352,65 @@ function makeRoutes(sctx) {
       const id = request?.id
       assertNewId(id)
       assertName(request?.name)
-      const { name, description, order, pluginsYaml } = request
-      const roster = await listRoster()
-      if (roster.some((preset) => preset.id === id)) {
+      const fields = presetFields(request)
+      const pluginsYaml = typeof request?.pluginsYaml === 'string' ? request.pluginsYaml : ''
+      parsePlugins(pluginsYaml)
+      await ensureNewId(id)
+      const doc = await readDoc()
+      if (doc.sections.some((section) => section.id === id)) {
         throw new BridgeError('duplicate', `A preset named "${id}" already exists.`)
       }
-      parsePlugins(pluginsYaml)
-      const declaration = { name, description, order, pluginsYaml }
-      await writeGeneratedBundle(id, declaration)
-      const result = await pluginManager.installBundle(join(generatedDir(), id), { saveExact: true })
-      return { ...summarize(result), ok: true, id }
+      doc.sections.push({ id, kind: 'insert', body: insertSection({ id, ...fields, pluginsYaml }) })
+      await writeDoc(doc.sections, doc.header)
+      const result = await applyDataBundle()
+      invalidateCaches()
+      return { ...result, ok: true, id }
     },
     async update(request) {
       const id = request?.id
       assertNewId(id)
       assertName(request?.name)
-      const { name, description, order, pluginsYaml } = request
-      if (typeof pluginsYaml === 'string' && /\b!!js\b/.test(pluginsYaml)) {
+      const fields = presetFields(request)
+      const pluginsYaml = typeof request?.pluginsYaml === 'string' ? request.pluginsYaml : ''
+      if (/\b!!js\b/.test(pluginsYaml)) {
         throw new BridgeError(
           'js-unsupported',
-          'Editing a preset with `!!js` expressions is not supported from this view yet. Create a fresh preset, or hand-edit the profile patch for that row.'
+          'Editing a preset with `!!js` expressions is not supported from this view yet. Create a fresh preset, or hand-edit the profile patch for that row.',
         )
       }
       parsePlugins(pluginsYaml)
-      const entry = configEditor.entries().find(
-        (candidate) => candidate.options.id === `preset-${id}` && candidate.options.name === PRESET_PACKAGE
-      )
-      if (entry === undefined) {
+      const doc = await readDoc()
+      const section = doc.sections.find((s) => s.id === id && s.kind === 'insert')
+      if (section === undefined) {
         throw new BridgeError(
           'not-live',
-          `Preset "${id}" is not an active row that can be edited here (it may be broken); delete and recreate it instead.`
+          `Preset "${id}" is not managed by this page (it may be shipped or declared by another bundle); delete and recreate it instead.`,
         )
       }
-      const fields = declarationFields({ name, description, order })
-      await configEditor.edit(entry, () => {
-        const next = { id }
-        if (fields.name !== undefined) next.name = fields.name
-        if (fields.description !== undefined) next.description = fields.description
-        if (fields.order !== undefined) next.order = fields.order
-        next.plugins = parse(pluginsYaml, { customTags: [JS_TAG] })
-        return next
-      })
-      return { ok: true, id, changed: true, application: 'applied' }
+      section.body = insertSection({ id, ...fields, pluginsYaml })
+      await writeDoc(doc.sections, doc.header)
+      const result = await applyDataBundle()
+      invalidateCaches()
+      return { ...result, ok: true, id, changed: true, application: 'applied' }
     },
     async remove(request) {
       const id = request?.id
       assertNewId(id)
-      const roster = await listRoster()
-      const target = roster.find((preset) => preset.id === id)
-      if (target === undefined) {
-        throw new BridgeError('not-found', `Preset "${id}" was not found.`)
-      }
-      if (!target.custom || typeof target.bundle !== 'string') {
+      const doc = await readDoc()
+      const index = doc.sections.findIndex((section) => section.id === id)
+      if (index === -1) {
         throw new BridgeError(
           'not-deletable',
-          `Preset "${id}" ships with the product and cannot be deleted here — duplicate it to make an editable copy.`
+          `Preset "${id}" is not managed by this page and cannot be deleted here — duplicate it to make an editable copy.`,
         )
       }
-      await removeOverrideRow(id)
-      const result = await pluginManager.removeBundle(target.bundle)
-      // best-effort: drop the generated source dir once the bundle layer is gone
-      try { await rm(join(generatedDir(), id), { recursive: true, force: true }) } catch { /* leftover source dir is harmless */ }
-      return { ...summarize(result), ok: true, id }
+      doc.sections.splice(index, 1)
+      await writeDoc(doc.sections, doc.header)
+      const result = await applyDataBundle()
+      invalidateCaches()
+      // best-effort: drop a stale per-preset source dir left by older versions
+      try { await rm(join(profileDir(), 'web-agent-presets', id), { recursive: true, force: true }) } catch { /* harmless */ }
+      return { ...result, ok: true, id }
     },
   }
 
